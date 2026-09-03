@@ -9,43 +9,35 @@ const ENDPOINTS = (process.env.ENDPOINTS || process.env.ENDPOINT || '')
 
 const gauges = new Map();
 
+const GENERIC_LABELS = [
+  'dtu',
+  'source',
+  'instance_id',
+  'unit'
+];
+
 function sanitizeMetricName(name) {
-  let result = name
-    .replace(/[^a-zA-Z0-9_:]/g, '_')
-    .replace(/^[^a-zA-Z_:]/, '_');
-
-  return result.toLowerCase();
-}
-
-function sanitizeLabelName(name) {
   return name
-    .replace(/[^a-zA-Z0-9_]/g, '_')
-    .replace(/^[^a-zA-Z_]/, '_')
+    .replace(/[^a-zA-Z0-9_:]/g, '_')
+    .replace(/^[^a-zA-Z_:]/, '_')
     .toLowerCase();
 }
 
-function metricKey(name, labelNames) {
-  return `${name}|${labelNames.join(',')}`;
-}
-
-function getGauge(name, labelNames) {
+function getGauge(name) {
   name = sanitizeMetricName(name);
 
-  const cleanLabelNames = labelNames.map(sanitizeLabelName);
-  const key = metricKey(name, cleanLabelNames);
-
-  if (!gauges.has(key)) {
+  if (!gauges.has(name)) {
     gauges.set(
-      key,
+      name,
       new client.Gauge({
         name,
         help: `WebSocket metric ${name}`,
-        labelNames: cleanLabelNames
+        labelNames: GENERIC_LABELS
       })
     );
   }
 
-  return gauges.get(key);
+  return gauges.get(name);
 }
 
 function setMetric(name, labels, value) {
@@ -55,58 +47,93 @@ function setMetric(name, labels, value) {
     return;
   }
 
-  const labelNames = Object.keys(labels);
-  const labelValues = Object.values(labels).map(v => String(v));
+  const finalLabels = {
+    dtu: labels.dtu || '',
+    source: labels.source || '',
+    instance_id: labels.instance_id || '',
+    unit: labels.unit || ''
+  };
 
-  const gauge = getGauge(name, labelNames);
-
-  gauge.labels(...labelValues).set(numericValue);
+  getGauge(name)
+    .labels(
+      finalLabels.dtu,
+      finalLabels.source,
+      finalLabels.instance_id,
+      finalLabels.unit
+    )
+    .set(numericValue);
 }
 
-function getEndpointName(endpoint) {
+function getEndpointInfo(endpoint) {
   try {
     const url = new URL(endpoint);
 
-    return `${url.hostname}${url.pathname}`
-      .replace(/^\/+/, '')
-      .replace(/\//g, '_');
+    return {
+      dtu: url.hostname,
+      source: url.pathname
+        .replace(/^\/+/, '')
+        .replace(/\/+/g, '_') || 'unknown'
+    };
   } catch {
-    return endpoint;
+    return {
+      dtu: 'unknown',
+      source: 'unknown'
+    };
   }
+}
+
+function normalizeBooleanString(value) {
+  const normalized = value.trim().toLowerCase();
+
+  if (
+    normalized === 'yes' ||
+    normalized === 'on' ||
+    normalized === 'true' ||
+    normalized === 'enabled'
+  ) {
+    return 1;
+  }
+
+  if (
+    normalized === 'no' ||
+    normalized === 'off' ||
+    normalized === 'false' ||
+    normalized === 'disabled'
+  ) {
+    return 0;
+  }
+
+  return null;
 }
 
 /**
  * Export arbitrary JSON recursively.
  *
- * Special handling:
+ * OpenDTU values:
  *
  *   { v: 50.53, u: "V", d: 2 }
  *
- * becomes one numeric metric with unit label.
+ * become a numeric metric with a unit label.
  *
- * Dynamic path:
+ * Dynamic instances:
  *
  *   instances/HQ2342C94PU/...
  *
- * becomes:
+ * become:
  *
  *   instance_id="HQ2342C94PU"
- *
- * instead of putting the serial into the metric name.
  */
 function exportJson(
   value,
   path = [],
-  labels = {},
-  context = {}
+  labels = {}
 ) {
   if (value === null || value === undefined) {
     return;
   }
 
   // ----------------------------------------------------------
-  // OpenDTU style value object:
-  //
+  // OpenDTU value object:
   // { v: 50.53, u: "V", d: 2 }
   // ----------------------------------------------------------
 
@@ -115,20 +142,68 @@ function exportJson(
     !Array.isArray(value) &&
     Object.prototype.hasOwnProperty.call(value, 'v')
   ) {
-    const metricLabels = { ...labels };
-
-    if (value.u !== undefined && value.u !== '') {
-      metricLabels.unit = String(value.u);
-    }
-
-    const metricName =
-      'websocket_' + path.join('_');
+    const metricLabels = {
+      ...labels,
+      unit:
+        value.u !== undefined
+          ? String(value.u)
+          : ''
+    };
 
     setMetric(
-      metricName,
+      'websocket_' + path.join('_'),
       metricLabels,
       value.v
     );
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // OpenDTU text / boolean wrapper:
+  //
+  // { value: "yes", translate: true }
+  // ----------------------------------------------------------
+
+  if (
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    Object.prototype.hasOwnProperty.call(value, 'value')
+  ) {
+    const wrappedValue = value.value;
+
+    if (typeof wrappedValue === 'number') {
+      setMetric(
+        'websocket_' + path.join('_'),
+        labels,
+        wrappedValue
+      );
+
+      return;
+    }
+
+    if (typeof wrappedValue === 'boolean') {
+      setMetric(
+        'websocket_' + path.join('_'),
+        labels,
+        wrappedValue ? 1 : 0
+      );
+
+      return;
+    }
+
+    if (typeof wrappedValue === 'string') {
+      const booleanValue =
+        normalizeBooleanString(wrappedValue);
+
+      if (booleanValue !== null) {
+        setMetric(
+          'websocket_' + path.join('_'),
+          labels,
+          booleanValue
+        );
+      }
+    }
 
     return;
   }
@@ -138,11 +213,8 @@ function exportJson(
   // ----------------------------------------------------------
 
   if (typeof value === 'number') {
-    const metricName =
-      'websocket_' + path.join('_');
-
     setMetric(
-      metricName,
+      'websocket_' + path.join('_'),
       labels,
       value
     );
@@ -155,15 +227,23 @@ function exportJson(
   // ----------------------------------------------------------
 
   if (typeof value === 'boolean') {
-    const metricName =
-      'websocket_' + path.join('_');
-
     setMetric(
-      metricName,
+      'websocket_' + path.join('_'),
       labels,
       value ? 1 : 0
     );
 
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // Plain strings
+  //
+  // Deliberately ignored for now.
+  // This avoids uncontrolled Prometheus label cardinality.
+  // ----------------------------------------------------------
+
+  if (typeof value === 'string') {
     return;
   }
 
@@ -175,12 +255,8 @@ function exportJson(
     value.forEach((child, index) => {
       exportJson(
         child,
-        path,
-        {
-          ...labels,
-          index
-        },
-        context
+        [...path, index.toString()],
+        labels
       );
     });
 
@@ -194,34 +270,22 @@ function exportJson(
   if (typeof value === 'object') {
     for (const [key, child] of Object.entries(value)) {
 
-      /*
-       * Special rule:
-       *
-       * "instances": {
-       *   "HQ2342C94PU": {...}
-       * }
-       *
-       * The child key should become a label instead of
-       * part of the metric name.
-       */
-
       if (
         key === 'instances' &&
         child &&
         typeof child === 'object' &&
         !Array.isArray(child)
       ) {
-        for (const [instanceId, instanceData] of Object.entries(child)) {
+        for (
+          const [instanceId, instanceData]
+          of Object.entries(child)
+        ) {
           exportJson(
             instanceData,
             path,
             {
               ...labels,
               instance_id: instanceId
-            },
-            {
-              ...context,
-              insideInstances: true
             }
           );
         }
@@ -232,8 +296,7 @@ function exportJson(
       exportJson(
         child,
         [...path, key],
-        labels,
-        context
+        labels
       );
     }
   }
@@ -247,13 +310,13 @@ function exportJson(
 const websocketUp = new client.Gauge({
   name: 'websocket_up',
   help: 'WebSocket connection status',
-  labelNames: ['endpoint']
+  labelNames: ['dtu', 'source']
 });
 
 const websocketMessages = new client.Counter({
   name: 'websocket_messages_total',
   help: 'Number of WebSocket messages received',
-  labelNames: ['endpoint']
+  labelNames: ['dtu', 'source']
 });
 
 
@@ -263,9 +326,13 @@ const websocketMessages = new client.Counter({
 
 ENDPOINTS.forEach(endpoint => {
 
-  const endpointName = getEndpointName(endpoint);
+  const endpointInfo =
+    getEndpointInfo(endpoint);
 
   console.log(`Opening WebSocket: ${endpoint}`);
+  console.log(
+    `DTU: ${endpointInfo.dtu}, source: ${endpointInfo.source}`
+  );
 
   const ws = new WebSocketClient();
 
@@ -273,7 +340,10 @@ ENDPOINTS.forEach(endpoint => {
     console.log(`Connected: ${endpoint}`);
 
     websocketUp
-      .labels(endpointName)
+      .labels(
+        endpointInfo.dtu,
+        endpointInfo.source
+      )
       .set(1);
   };
 
@@ -281,7 +351,10 @@ ENDPOINTS.forEach(endpoint => {
     console.error(`WebSocket error: ${endpoint}`, e);
 
     websocketUp
-      .labels(endpointName)
+      .labels(
+        endpointInfo.dtu,
+        endpointInfo.source
+      )
       .set(0);
   };
 
@@ -289,23 +362,33 @@ ENDPOINTS.forEach(endpoint => {
     console.log(`WebSocket closed: ${endpoint}`);
 
     websocketUp
-      .labels(endpointName)
+      .labels(
+        endpointInfo.dtu,
+        endpointInfo.source
+      )
       .set(0);
   };
 
   ws.onmessage = function (data) {
     try {
       websocketMessages
-        .labels(endpointName)
+        .labels(
+          endpointInfo.dtu,
+          endpointInfo.source
+        )
         .inc();
 
-      const json = JSON.parse(data.toString());
+      const json =
+        JSON.parse(data.toString());
 
       exportJson(
         json,
         [],
         {
-          endpoint: endpointName
+          dtu: endpointInfo.dtu,
+          source: endpointInfo.source,
+          instance_id: '',
+          unit: ''
         }
       );
 
@@ -335,19 +418,26 @@ server.get('/metrics', async (req, res) => {
     res.end(
       await client.register.metrics()
     );
+
   } catch (e) {
     res.status(500).end(e.message);
   }
 });
 
 server.get('/', (req, res) => {
-  res.type('text/plain').send(
-    `WebSocket Exporter running\nConfigured endpoints: ${ENDPOINTS.length}\n`
-  );
+  res
+    .type('text/plain')
+    .send(
+      `WebSocket Exporter running\n` +
+      `Configured endpoints: ${ENDPOINTS.length}\n`
+    );
 });
 
-const PORT = process.env.PORT || 9189;
+const PORT =
+  process.env.PORT || 9189;
 
 server.listen(PORT, () => {
-  console.log(`Exporter listening on port ${PORT}`);
+  console.log(
+    `Exporter listening on port ${PORT}`
+  );
 });
