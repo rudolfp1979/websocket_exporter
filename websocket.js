@@ -236,18 +236,20 @@ function () {
         );
     }
 
-    this.reconnectTimer =
-        setTimeout(() => {
+   this.reconnectTimer =
+    setTimeout(() => {
 
-            console.log(
-                `Retrying WebSocket with authentication: ${this.url}`
-            );
+        this.reconnectTimer = null;
 
-            this.open(
-                this.url
-            );
+        console.log(
+            `Retrying WebSocket with authentication: ${this.url}`
+        );
 
-        }, 100);
+        this.open(
+            this.url
+        );
+
+    }, 100);
 };
 
 WebSocketClient.prototype.reconnect =
