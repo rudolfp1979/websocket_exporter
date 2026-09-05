@@ -28,11 +28,18 @@ function parseDigestChallenge(header) {
     return params;
 }
 
-function createDigestHeader(url, username, password, challenge) {
+function createDigestHeader(
+    url,
+    username,
+    password,
+    challenge
+) {
     const parsedUrl = new URL(url);
 
     const method = 'GET';
-    const uri = parsedUrl.pathname + parsedUrl.search;
+    const uri =
+        parsedUrl.pathname +
+        parsedUrl.search;
 
     const realm = challenge.realm;
     const nonce = challenge.nonce;
@@ -40,7 +47,11 @@ function createDigestHeader(url, username, password, challenge) {
     const opaque = challenge.opaque;
 
     const nc = '00000001';
-    const cnonce = crypto.randomBytes(8).toString('hex');
+
+    const cnonce =
+        crypto
+            .randomBytes(8)
+            .toString('hex');
 
     const ha1 = md5(
         `${username}:${realm}:${password}`
@@ -66,7 +77,8 @@ function createDigestHeader(url, username, password, challenge) {
         `cnonce="${cnonce}"`;
 
     if (opaque) {
-        header += `, opaque="${opaque}"`;
+        header +=
+            `, opaque="${opaque}"`;
     }
 
     return header;
@@ -74,17 +86,29 @@ function createDigestHeader(url, username, password, challenge) {
 
 function WebSocketClient() {
     this.number = 0;
-    this.autoReconnectInterval = 5 * 1000;
+
+    this.autoReconnectInterval =
+        5 * 1000;
 
     this.digestChallenge = null;
+
     this.reconnectTimer = null;
+
+    this.instance = null;
+
+    this.url = null;
 }
 
-WebSocketClient.prototype.open = function (url) {
+WebSocketClient.prototype.open =
+function (url) {
+
     this.url = url;
 
-    const username = process.env.WS_USERNAME;
-    const password = process.env.WS_PASSWORD;
+    const username =
+        process.env.WS_USERNAME;
+
+    const password =
+        process.env.WS_PASSWORD;
 
     const options = {};
 
@@ -94,12 +118,13 @@ WebSocketClient.prototype.open = function (url) {
         this.digestChallenge
     ) {
         options.headers = {
-            Authorization: createDigestHeader(
-                this.url,
-                username,
-                password,
-                this.digestChallenge
-            )
+            Authorization:
+                createDigestHeader(
+                    this.url,
+                    username,
+                    password,
+                    this.digestChallenge
+                )
         };
 
         console.log(
@@ -107,23 +132,32 @@ WebSocketClient.prototype.open = function (url) {
         );
     }
 
-    this.instance = new WebSocket(
-        this.url,
-        options
+    console.log(
+        `Opening WebSocket: ${this.url}`
     );
 
+    this.instance =
+        new WebSocket(
+            this.url,
+            options
+        );
+
     /*
-     * Important:
-     * ws emits "unexpected-response" when the HTTP
-     * WebSocket handshake returns e.g. 401.
+     * ws emits "unexpected-response"
+     * when the HTTP WebSocket handshake
+     * returns e.g. 401, 404, 500, ...
      */
     this.instance.on(
         'unexpected-response',
         (request, response) => {
 
-            if (response.statusCode === 401) {
+            if (
+                response.statusCode === 401
+            ) {
                 const authHeader =
-                    response.headers['www-authenticate'];
+                    response.headers[
+                        'www-authenticate'
+                    ];
 
                 console.log(
                     `Authentication required for ${this.url}`
@@ -134,10 +168,13 @@ WebSocketClient.prototype.open = function (url) {
                 );
 
                 const challenge =
-                    parseDigestChallenge(authHeader);
+                    parseDigestChallenge(
+                        authHeader
+                    );
 
                 if (challenge) {
-                    this.digestChallenge = challenge;
+                    this.digestChallenge =
+                        challenge;
 
                     response.resume();
 
@@ -150,20 +187,47 @@ WebSocketClient.prototype.open = function (url) {
             }
 
             console.error(
-                `Unexpected server response: ${response.statusCode}`
+                `Unexpected server response for ${this.url}: ${response.statusCode}`
             );
 
             response.resume();
+
+            request.abort();
+
+            this.reconnect({
+                type:
+                    'unexpected-response',
+
+                statusCode:
+                    response.statusCode
+            });
         }
     );
 
-    this.instance.on('open', () => {
-        console.log(
-            `WebSocket connected: ${this.url}`
-        );
+    this.instance.on(
+        'open',
+        () => {
 
-        this.onopen();
-    });
+            console.log(
+                `WebSocket connected: ${this.url}`
+            );
+
+            /*
+             * If there is still an old
+             * reconnect timer, remove it.
+             */
+            if (this.reconnectTimer) {
+                clearTimeout(
+                    this.reconnectTimer
+                );
+
+                this.reconnectTimer =
+                    null;
+            }
+
+            this.onopen();
+        }
+    );
 
     this.instance.on(
         'message',
@@ -179,55 +243,104 @@ WebSocketClient.prototype.open = function (url) {
         }
     );
 
+    /*
+     * Always reconnect after a close.
+     *
+     * Even code 1000 is retried because
+     * this exporter expects the endpoint
+     * to stay permanently connected.
+     */
     this.instance.on(
         'close',
         (code, reason) => {
 
             const e = {
+                type: 'close',
+
                 code: code,
-                reason: reason
-                    ? reason.toString()
-                    : ''
+
+                reason:
+                    reason
+                        ? reason.toString()
+                        : ''
             };
 
-            if (code !== 1000) {
-                this.reconnect(e);
-            }
+            console.log(
+                `WebSocket closed: ${this.url}`,
+                e
+            );
+
+            this.reconnect(e);
 
             this.onclose(e);
         }
     );
 
+    /*
+     * Also schedule a reconnect on error.
+     *
+     * Usually "close" follows an error,
+     * but reconnect() is protected by
+     * reconnectTimer, so duplicate retries
+     * are prevented.
+     */
     this.instance.on(
         'error',
         (e) => {
 
+            console.error(
+                `WebSocket error: ${this.url}: ${e.message}`
+            );
+
             this.onerror(e);
 
-            /*
-             * Do not immediately reconnect on every error,
-             * because "close" normally follows and handles it.
-             */
+            this.reconnect({
+                type: 'error',
+                error: e.message
+            });
         }
     );
 };
 
 WebSocketClient.prototype.send =
 function (data, option) {
+
     try {
+        if (
+            !this.instance ||
+            this.instance.readyState !==
+                WebSocket.OPEN
+        ) {
+            throw new Error(
+                'WebSocket is not connected'
+            );
+        }
+
         this.instance.send(
             data,
             option
         );
+
     } catch (e) {
-        this.instance.emit(
-            'error',
-            e
-        );
+
+        if (this.instance) {
+            this.instance.emit(
+                'error',
+                e
+            );
+        } else {
+            this.onerror(e);
+
+            this.reconnect({
+                type: 'send-error',
+                error: e.message
+            });
+        }
     }
 };
 
-WebSocketClient.prototype.reconnectImmediately =
+WebSocketClient.prototype
+    .reconnectImmediately =
 function () {
 
     if (this.reconnectTimer) {
@@ -236,48 +349,69 @@ function () {
         );
     }
 
-   this.reconnectTimer =
-    setTimeout(() => {
+    this.reconnectTimer =
+        setTimeout(
+            () => {
 
-        this.reconnectTimer = null;
+                /*
+                 * Important:
+                 * timer must be released
+                 * before open().
+                 */
+                this.reconnectTimer =
+                    null;
 
-        console.log(
-            `Retrying WebSocket with authentication: ${this.url}`
+                console.log(
+                    `Retrying WebSocket with authentication: ${this.url}`
+                );
+
+                this.open(
+                    this.url
+                );
+
+            },
+            100
         );
-
-        this.open(
-            this.url
-        );
-
-    }, 100);
 };
 
 WebSocketClient.prototype.reconnect =
 function (e) {
 
+    /*
+     * A reconnect is already scheduled.
+     */
     if (this.reconnectTimer) {
         return;
     }
 
     console.log(
-        `WebSocketClient: retry in ${this.autoReconnectInterval}ms`,
+        `WebSocketClient: retry in ${this.autoReconnectInterval}ms: ${this.url}`,
         e
     );
 
     this.reconnectTimer =
-        setTimeout(() => {
+        setTimeout(
+            () => {
 
-            this.reconnectTimer = null;
+                /*
+                 * Important:
+                 * release timer before
+                 * attempting to reconnect.
+                 */
+                this.reconnectTimer =
+                    null;
 
-            console.log(
-                `WebSocketClient: reconnecting ${this.url}`
-            );
+                console.log(
+                    `WebSocketClient: reconnecting ${this.url}`
+                );
 
-            this.open(
-                this.url
-            );
+                this.open(
+                    this.url
+                );
 
-        }, this.autoReconnectInterval);
+            },
+            this.autoReconnectInterval
+        );
 };
 
 WebSocketClient.prototype.onopen =
