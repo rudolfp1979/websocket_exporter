@@ -97,7 +97,132 @@ function WebSocketClient() {
     this.instance = null;
 
     this.url = null;
+
+    /*
+     * Watchdog:
+     *
+     * If no WebSocket message is received
+     * for this amount of time, the connection
+     * is considered stale/dead.
+     *
+     * This is important because after an
+     * OpenDTU reboot the TCP connection may
+     * remain OPEN from Node.js' point of view
+     * even though no more data can arrive.
+     */
+    this.watchdogTimeout =
+        30 * 1000;
+
+    this.watchdogTimer = null;
 }
+
+/*
+ * Start or reset the watchdog.
+ *
+ * Called after the WebSocket connects and
+ * after every received WebSocket message.
+ */
+WebSocketClient.prototype.resetWatchdog =
+function () {
+
+    if (this.watchdogTimer) {
+        clearTimeout(
+            this.watchdogTimer
+        );
+
+        this.watchdogTimer =
+            null;
+    }
+
+    this.watchdogTimer =
+        setTimeout(
+            () => {
+
+                /*
+                 * Release the timer first.
+                 */
+                this.watchdogTimer =
+                    null;
+
+                console.error(
+                    `WebSocket watchdog timeout: no data received for ${this.watchdogTimeout / 1000}s from ${this.url}`
+                );
+
+                /*
+                 * The WebSocket may still
+                 * appear OPEN locally although
+                 * the remote OpenDTU has
+                 * disappeared/rebooted.
+                 *
+                 * terminate() forces the socket
+                 * closed. The "close" handler
+                 * below will then schedule the
+                 * normal reconnect.
+                 */
+                if (this.instance) {
+
+                    try {
+
+                        console.log(
+                            `WebSocket watchdog: terminating stale connection ${this.url}`
+                        );
+
+                        this.instance
+                            .terminate();
+
+                    } catch (e) {
+
+                        console.error(
+                            `WebSocket watchdog: failed to terminate ${this.url}: ${e.message}`
+                        );
+
+                        /*
+                         * If terminate itself
+                         * fails, explicitly
+                         * schedule reconnect.
+                         */
+                        this.reconnect({
+                            type:
+                                'watchdog',
+
+                            error:
+                                e.message
+                        });
+                    }
+
+                } else {
+
+                    /*
+                     * No socket object exists.
+                     * Schedule reconnect directly.
+                     */
+                    this.reconnect({
+                        type:
+                            'watchdog'
+                    });
+                }
+
+            },
+            this.watchdogTimeout
+        );
+};
+
+/*
+ * Stop the watchdog.
+ */
+WebSocketClient.prototype.stopWatchdog =
+function () {
+
+    if (this.watchdogTimer) {
+
+        clearTimeout(
+            this.watchdogTimer
+        );
+
+        this.watchdogTimer =
+            null;
+    }
+};
 
 WebSocketClient.prototype.open =
 function (url) {
@@ -173,6 +298,7 @@ function (url) {
                     );
 
                 if (challenge) {
+
                     this.digestChallenge =
                         challenge;
 
@@ -217,6 +343,7 @@ function (url) {
              * reconnect timer, remove it.
              */
             if (this.reconnectTimer) {
+
                 clearTimeout(
                     this.reconnectTimer
                 );
@@ -225,6 +352,12 @@ function (url) {
                     null;
             }
 
+            /*
+             * Start the watchdog as soon
+             * as the connection is open.
+             */
+            this.resetWatchdog();
+
             this.onopen();
         }
     );
@@ -232,6 +365,12 @@ function (url) {
     this.instance.on(
         'message',
         (data, flags) => {
+
+            /*
+             * We received data, therefore
+             * the connection is alive.
+             */
+            this.resetWatchdog();
 
             this.number++;
 
@@ -253,6 +392,12 @@ function (url) {
     this.instance.on(
         'close',
         (code, reason) => {
+
+            /*
+             * This connection no longer
+             * needs its watchdog.
+             */
+            this.stopWatchdog();
 
             const e = {
                 type: 'close',
@@ -306,6 +451,7 @@ WebSocketClient.prototype.send =
 function (data, option) {
 
     try {
+
         if (
             !this.instance ||
             this.instance.readyState !==
@@ -324,16 +470,22 @@ function (data, option) {
     } catch (e) {
 
         if (this.instance) {
+
             this.instance.emit(
                 'error',
                 e
             );
+
         } else {
+
             this.onerror(e);
 
             this.reconnect({
-                type: 'send-error',
-                error: e.message
+                type:
+                    'send-error',
+
+                error:
+                    e.message
             });
         }
     }
@@ -344,6 +496,7 @@ WebSocketClient.prototype
 function () {
 
     if (this.reconnectTimer) {
+
         clearTimeout(
             this.reconnectTimer
         );
